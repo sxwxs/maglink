@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maglink"
+version = "0.1.0"
+description = "Email magic-link auth with device-flow confirmation. Framework-agnostic core, optional Flask adapter."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "newlinknote" }]
+keywords = ["auth", "email", "magic-link", "device-flow", "flask"]
+dependencies = []
+
+[project.optional-dependencies]
+flask = ["Flask>=2.0"]
+dev = ["Flask>=2.0", "pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["maglink*"]
