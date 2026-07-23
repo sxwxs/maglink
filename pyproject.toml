@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,9 +8,17 @@ version = "0.2.0"
 description = "Email magic-link auth with device-flow confirmation. Framework-agnostic core, optional Flask adapter."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
-authors = [{ name = "newlinknote" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "sxwxs", email = "sxwxs@msn.com" }]
 keywords = ["auth", "email", "magic-link", "device-flow", "flask"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Topic :: Internet :: WWW/HTTP",
+]
 dependencies = []
 
 [project.optional-dependencies]
