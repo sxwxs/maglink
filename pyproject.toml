@@ -21,6 +21,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/sxwxs/maglink"
+Repository = "https://github.com/sxwxs/maglink.git"
+Issues = "https://github.com/sxwxs/maglink/issues"
+
 [project.optional-dependencies]
 flask = ["Flask>=2.0"]
 dev = ["Flask>=2.0", "pytest>=7"]
