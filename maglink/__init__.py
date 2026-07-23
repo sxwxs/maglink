@@ -5,8 +5,18 @@ imported lazily so installing without Flask still works for the core/tests.
 """
 
 from .core import AuthCore, LoginRequest, AuthError, RateLimited
+from .identity import Identity, IdentityProvider, StaticIdentityProvider
 from .stores import TokenStore, MemoryStore, SqliteStore
-from .mailer import Mailer, SmtpMailer, ConsoleMailer
+from .mailer import (
+    MailDeliveryError,
+    MailMessage,
+    MailPriority,
+    MailReceipt,
+    Mailer,
+    SmtpMailer,
+    ConsoleMailer,
+    HttpMailer,
+)
 from .captcha import Captcha
 
 __all__ = [
@@ -14,12 +24,20 @@ __all__ = [
     "LoginRequest",
     "AuthError",
     "RateLimited",
+    "Identity",
+    "IdentityProvider",
+    "StaticIdentityProvider",
     "TokenStore",
     "MemoryStore",
     "SqliteStore",
+    "MailDeliveryError",
+    "MailMessage",
+    "MailPriority",
+    "MailReceipt",
     "Mailer",
     "SmtpMailer",
     "ConsoleMailer",
+    "HttpMailer",
     "Captcha",
     "EmailAuth",
 ]

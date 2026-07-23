@@ -16,7 +16,6 @@ from typing import Optional
 
 from flask import (
     Blueprint,
-    current_app,
     jsonify,
     request,
     session,
@@ -30,21 +29,43 @@ _SESSION_CAPTCHA = "_maglink_captcha"
 
 
 class EmailAuth:
-    def __init__(self, core: AuthCore, *, require_captcha: bool = True) -> None:
+    def __init__(
+        self,
+        core: AuthCore,
+        *,
+        require_captcha: bool = True,
+        trust_proxy_headers: bool = False,
+    ) -> None:
         self.core = core
         self.require_captcha = require_captcha
+        self.trust_proxy_headers = trust_proxy_headers
 
     # ---- host-facing API -------------------------------------------------
 
     def is_authenticated(self, req=None) -> bool:
-        return bool(session.get(_SESSION_USER))
+        return self.current_user(req) is not None
 
     def current_user(self, req=None) -> Optional[dict]:
-        return session.get(_SESSION_USER)
+        stored = session.get(_SESSION_USER)
+        if not stored:
+            return None
+        identity = self.core.get_identity(stored.get("email", ""))
+        if identity is None or not identity.active:
+            session.pop(_SESSION_USER, None)
+            return None
+        # Authorization is refreshed from the provider on every request, so a
+        # disabled or demoted database user does not retain stale privileges.
+        return {
+            "id": identity.id,
+            "email": identity.email,
+            "roles": list(identity.roles),
+            "claims": identity.claims,
+            "is_admin": identity.is_admin,
+        }
 
     def is_admin(self, req=None) -> bool:
-        u = session.get(_SESSION_USER)
-        return bool(u and u.get("is_admin"))
+        user = self.current_user(req)
+        return bool(user and user.get("is_admin"))
 
     def login_required(self, fn):
         @functools.wraps(fn)
@@ -90,7 +111,7 @@ class EmailAuth:
                     email,
                     captcha_given=captcha_given,
                     captcha_expected=captcha_expected,
-                    client_ip=_client_ip(),
+                    client_ip=self._client_ip(),
                     require_captcha=self.require_captcha,
                 )
             except RateLimited as e:
@@ -115,8 +136,9 @@ class EmailAuth:
         def verify_confirm():
             data = request.get_json(silent=True) or request.form
             token = data.get("token") or request.args.get("token", "")
+            user_code = data.get("user_code") or data.get("code") or ""
             try:
-                res = self.core.confirm(token)
+                res = self.core.confirm(token, user_code)
             except AuthError as e:
                 return jsonify({"ok": False, "error": "invalid", "message": str(e)}), 400
             return jsonify({"ok": True, "email": res["email"]})
@@ -126,7 +148,13 @@ class EmailAuth:
             rid = session.get(_SESSION_REQ, "")
             res = self.core.poll_status(rid)
             if res["status"] == "approved":
-                session[_SESSION_USER] = {"email": res["email"], "is_admin": res["is_admin"]}
+                session[_SESSION_USER] = {
+                    "id": res.get("identity_id", res["email"]),
+                    "email": res["email"],
+                    "roles": res.get("roles", []),
+                    "claims": res.get("claims", {}),
+                    "is_admin": res["is_admin"],
+                }
                 session.pop(_SESSION_REQ, None)
                 return jsonify({"ok": True, "status": "approved", "email": res["email"]})
             return jsonify({"ok": True, "status": res["status"]})
@@ -148,13 +176,12 @@ class EmailAuth:
 
         return bp
 
-
-def _client_ip() -> str:
-    # Honor a single proxy hop if present; fall back to remote_addr.
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.remote_addr or ""
+    def _client_ip(self) -> str:
+        if self.trust_proxy_headers:
+            fwd = request.headers.get("X-Forwarded-For", "")
+            if fwd:
+                return fwd.split(",")[0].strip()
+        return request.remote_addr or ""
 
 
 def _confirm_html(token: str, ctx: dict) -> str:
@@ -165,7 +192,6 @@ def _confirm_html(token: str, ctx: dict) -> str:
             "<h1>Link invalid or expired</h1>"
             "<p>This sign-in link is no longer valid. Please start again.</p>"
         )
-    code = html.escape(ctx["user_code"])
     email = html.escape(ctx["email"])
     safe_token = html.escape(token)
     done = (
@@ -179,15 +205,27 @@ def _confirm_html(token: str, ctx: dict) -> str:
 <body style="font-family:system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem">
 <h1>Confirm sign-in</h1>
 <p>You're signing in as <b>{email}</b>.</p>
-<p>The device where you started should show this code:</p>
-<p style="font-size:2rem;font-weight:bold;letter-spacing:.1em">{code}</p>
-<p>If it matches, confirm below. If you didn't start this, close this page.</p>
+<p>Enter the code shown on the device where you started signing in.</p>
 {done}
-<button id="go" style="font-size:1rem;padding:.6rem 1.2rem;cursor:pointer">Confirm sign-in</button>
+<form id="confirm-form">
+  <input id="token" type="hidden" value="{safe_token}">
+  <input id="code" name="user_code" inputmode="text" autocomplete="one-time-code"
+         style="font-size:1.25rem;padding:.5rem;width:10rem;text-transform:uppercase"
+         aria-label="Sign-in code" required autofocus>
+  <button id="go" style="font-size:1rem;padding:.6rem 1.2rem;cursor:pointer">Confirm sign-in</button>
+</form>
 <p id="msg"></p>
 <script>
-document.getElementById('go').onclick = async () => {{
-  const r = await fetch('verify/confirm?token={safe_token}', {{method:'POST'}});
+document.getElementById('confirm-form').onsubmit = async (event) => {{
+  event.preventDefault();
+  const r = await fetch('verify/confirm', {{
+    method:'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{
+      token: document.getElementById('token').value,
+      user_code: document.getElementById('code').value
+    }})
+  }});
   const j = await r.json();
   document.getElementById('msg').textContent =
     j.ok ? 'Confirmed. Return to your other device.' : (j.message || 'Failed.');

@@ -5,9 +5,10 @@ The flow (see DESIGN.md §11.2):
 1. ``start_login``  -> mint request_id (caller binds to the browser session),
    user_code (shown on the waiting device), verify_token (emailed in the link).
    Emails the link. Returns the user_code to display.
-2. ``confirm_context``  -> SIDE-EFFECT-FREE lookup for rendering the confirm page
-   (shows the expected user_code). Safe for link prefetch.
-3. ``confirm``  -> the deliberate human action; marks the request approved.
+2. ``confirm_context``  -> SIDE-EFFECT-FREE lookup for rendering the confirm page.
+   Safe for link prefetch and does not reveal the user_code.
+3. ``confirm``  -> the deliberate human action; requires the user_code shown on
+   the waiting device and marks the request approved.
 4. ``poll_status``  -> the waiting device polls by its request_id; once approved,
    atomically consumes the request and returns the authenticated email.
 
@@ -18,6 +19,7 @@ anyone in on its own.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import secrets
@@ -26,7 +28,8 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from .captcha import Captcha
-from .mailer import Mailer
+from .identity import Identity, IdentityProvider, StaticIdentityProvider
+from .mailer import MailDeliveryError, MailMessage, MailPriority, Mailer
 from .stores import StoredRequest, TokenStore
 
 log = logging.getLogger("maglink.audit")
@@ -63,6 +66,23 @@ def _gen_user_code(n: int = 6) -> str:
     return f"{raw[:mid]}-{raw[mid:]}"
 
 
+def _normalize_user_code(code: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+
+
+def _check_user_code(expected: str, given: str) -> bool:
+    normalized_expected = _normalize_user_code(expected)
+    normalized_given = _normalize_user_code(given)
+    if not normalized_expected or not normalized_given:
+        return False
+    return secrets.compare_digest(normalized_expected, normalized_given)
+
+
+def _rate_key(kind: str, value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{kind}:{digest}"
+
+
 class AuthCore:
     def __init__(
         self,
@@ -78,26 +98,39 @@ class AuthCore:
         rate_window: float = 3600.0,
         captcha: Optional[Captcha] = None,
         email_subject: str = "Confirm your sign-in",
+        identity_provider: Optional[IdentityProvider] = None,
+        login_sender_id: Optional[str] = None,
+        login_mail_priority: int = int(MailPriority.AUTHENTICATION),
+        confirm_max_attempts: int = 8,
     ) -> None:
         self.store = store
         self.mailer = mailer
         self.verify_url_base = verify_url_base.rstrip("/")
-        self.allowed = {e.lower() for e in (allowed_emails or [])}
-        self.allow_anyone = allow_anyone
-        self.admins = {e.lower() for e in (admin_emails or [])}
+        self.identity_provider = identity_provider or StaticIdentityProvider(
+            allowed_emails=allowed_emails,
+            admin_emails=admin_emails,
+            allow_anyone=allow_anyone,
+        )
         self.code_ttl = code_ttl
         self.rate_max = rate_max
         self.rate_window = rate_window
         self.captcha = captcha or Captcha()
         self.email_subject = email_subject
+        self.login_sender_id = login_sender_id
+        self.login_mail_priority = int(login_mail_priority)
+        self.confirm_max_attempts = confirm_max_attempts
 
     # ---- helpers ---------------------------------------------------------
 
     def is_email_allowed(self, email: str) -> bool:
-        return self.allow_anyone or email.lower() in self.allowed
+        return self.identity_provider.can_login(email.lower())
+
+    def get_identity(self, email: str) -> Optional[Identity]:
+        return self.identity_provider.get_identity(email.lower())
 
     def is_admin(self, email: str) -> bool:
-        return email.lower() in self.admins
+        identity = self.get_identity(email)
+        return bool(identity and identity.is_admin)
 
     def new_captcha(self) -> tuple[str, str]:
         """Return ``(code, svg_data_uri)``; caller stores the code in session."""
@@ -118,13 +151,10 @@ class AuthCore:
         now = _now()
         self.store.purge_expired(now)
 
-        # Rate limit FIRST and uniformly — before allowlist/validity checks — so
-        # response timing/shape can't be used to enumerate valid emails.
-        self._check_rate(f"ip:{client_ip}", now)
-        self._check_rate(f"email:{email}", now)
-
-        if not _EMAIL_RE.match(email):
+        self._check_rate(_rate_key("ip", client_ip), now)
+        if len(email) > 320 or not _EMAIL_RE.match(email):
             raise AuthError("Invalid email address.")
+        self._check_rate(_rate_key("email", email), now)
         if require_captcha and not Captcha.check(captcha_expected, captcha_given):
             raise AuthError("Incorrect captcha.")
 
@@ -132,37 +162,57 @@ class AuthCore:
         verify_token = secrets.token_urlsafe(32)
         user_code = _gen_user_code()
 
-        # Only persist + email for allowed addresses, but DO NOT change the
-        # response for disallowed ones (uniform success-looking result) to avoid
-        # leaking which emails are permitted.
+        req = StoredRequest(
+            request_id=request_id,
+            email=email,
+            user_code=user_code,
+            verify_token=verify_token,
+            status="pending",
+            created_at=now,
+            expires_at=now + self.code_ttl,
+        )
+        self.store.put(req)
+
+        # Email only allowed addresses, but keep a decoy pending request for
+        # disallowed addresses so status polling cannot enumerate the allowlist.
         if self.is_email_allowed(email):
-            self.store.put(
-                StoredRequest(
-                    request_id=request_id,
-                    email=email,
-                    user_code=user_code,
-                    verify_token=verify_token,
-                    status="pending",
-                    created_at=now,
-                    expires_at=now + self.code_ttl,
-                )
-            )
             link = f"{self.verify_url_base}?token={verify_token}"
             body = (
                 f"Someone requested a sign-in for this email.\n\n"
                 f"Open this link to continue:\n{link}\n\n"
-                f"Then confirm the code shown on the device where you started "
-                f"signing in. The code is: {user_code}\n\n"
+                f"The device where you started signing in shows a short code. "
+                f"Enter that code on the confirmation page to approve the sign-in.\n\n"
                 f"If you didn't request this, ignore this email.\n"
                 f"This link expires in {int(self.code_ttl // 60)} minutes."
             )
-            self.mailer.send(email, self.email_subject, body)
+            message = MailMessage(
+                to=(email,),
+                subject=self.email_subject,
+                text=body,
+                sender_id=self.login_sender_id,
+                priority=self.login_mail_priority,
+                purpose="authentication",
+                idempotency_key=f"maglink:{request_id}",
+                metadata={"request_id": request_id},
+            )
+            try:
+                self.mailer.send(message)
+            except MailDeliveryError as exc:
+                self.store.delete(request_id)
+                log.error(
+                    "LOGIN_EMAIL_REJECTED email=%s ip=%s request_id=%s err=%s",
+                    email,
+                    client_ip,
+                    request_id,
+                    exc,
+                )
+                raise AuthError("Could not queue the sign-in email. Please retry.") from exc
             log.info("LOGIN_REQUEST email=%s ip=%s request_id=%s", email, client_ip, request_id)
         else:
-            log.info("LOGIN_REQUEST_DENIED email=%s ip=%s", email, client_ip)
+            log.info("LOGIN_REQUEST_DECOY email=%s ip=%s request_id=%s", email, client_ip, request_id)
 
         # request_id + user_code returned regardless; for a disallowed email the
-        # request_id simply never becomes approvable.
+        # request stays pending until expiry but no email token is delivered.
         return LoginRequest(request_id=request_id, user_code=user_code)
 
     def _check_rate(self, key: str, now: float) -> None:
@@ -182,19 +232,29 @@ class AuthCore:
         return {
             "valid": True,
             "email": req.email,
-            "user_code": req.user_code,
             "already_approved": req.status == "approved",
         }
 
     # ---- step 3: confirm (the deliberate action) -------------------------
 
-    def confirm(self, verify_token: str) -> dict:
+    def confirm(self, verify_token: str, user_code: str = "") -> dict:
         now = _now()
-        req = self.store.get_by_token(verify_token or "")
+        token = verify_token or ""
+        if len(token) > 256:
+            raise AuthError("This sign-in link is invalid or has expired.")
+        if self.confirm_max_attempts > 0:
+            count = self.store.incr_rate(
+                _rate_key("confirm", token), now, self.code_ttl
+            )
+            if count > self.confirm_max_attempts:
+                raise RateLimited("Too many confirmation attempts. Start again.")
+        req = self.store.get_by_token(token)
         if req is None or req.expires_at < now:
             raise AuthError("This sign-in link is invalid or has expired.")
         if req.status == "consumed":
             raise AuthError("This sign-in has already been completed.")
+        if not _check_user_code(req.user_code, user_code):
+            raise AuthError("Incorrect sign-in code.")
         # pending -> approved, atomically (idempotent if already approved).
         if req.status == "pending":
             if not self.store.set_status(req.request_id, "pending", "approved"):
@@ -219,6 +279,16 @@ class AuthCore:
             if self.store.set_status(request_id, "approved", "consumed"):
                 self.store.delete(request_id)
                 log.info("LOGIN_SUCCESS email=%s request_id=%s", req.email, request_id)
-                return {"status": "approved", "email": req.email, "is_admin": self.is_admin(req.email)}
+                identity = self.get_identity(req.email)
+                if identity is None or not identity.active:
+                    return {"status": "expired"}
+                return {
+                    "status": "approved",
+                    "email": req.email,
+                    "identity_id": identity.id,
+                    "roles": list(identity.roles),
+                    "claims": identity.claims,
+                    "is_admin": identity.is_admin,
+                }
             return {"status": "pending"}
         return {"status": "expired"}

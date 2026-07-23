@@ -1,38 +1,111 @@
-"""Email delivery. ``Mailer`` is the interface; the core only calls ``send``.
+"""Pluggable mail delivery for maglink.
 
-``SmtpMailer`` sends in a background thread so a slow/unreachable SMTP server
-never stalls the HTTP request that triggered it. ``ConsoleMailer`` prints the
-link (dev/tests) and records the last message for assertions.
+The core emits a structured :class:`MailMessage`. Built-in implementations can
+print, submit directly to SMTP, or enqueue through an HTTP mail service. Custom
+hosts may inject any object implementing ``Mailer.send(message)``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import smtplib
 import ssl
-import threading
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from enum import IntEnum
 from email.message import EmailMessage
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol, Union
 
 log = logging.getLogger("maglink.mailer")
 
 
+class MailPriority(IntEnum):
+    BULK = 10
+    NORMAL = 100
+    HIGH = 500
+    SYSTEM = 800
+    AUTHENTICATION = 1000
+
+
+@dataclass(frozen=True)
+class MailMessage:
+    to: tuple[str, ...]
+    subject: str
+    text: Optional[str] = None
+    html: Optional[str] = None
+    sender_id: Optional[str] = None
+    reply_to: Optional[str] = None
+    priority: int = int(MailPriority.NORMAL)
+    purpose: str = "transactional"
+    idempotency_key: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MailReceipt:
+    accepted: bool
+    message_id: Optional[str] = None
+    status: str = "accepted"
+
+
+class MailDeliveryError(RuntimeError):
+    pass
+
+
 class Mailer(Protocol):
-    def send(self, to: str, subject: str, body: str) -> None: ...
+    def send(self, message: MailMessage) -> MailReceipt: ...
+
+
+def _coerce_message(
+    message_or_to: Union[MailMessage, str],
+    subject: Optional[str] = None,
+    body: Optional[str] = None,
+) -> MailMessage:
+    """Accept the v0.1 ``send(to, subject, body)`` shape for compatibility."""
+    if isinstance(message_or_to, MailMessage):
+        return message_or_to
+    return MailMessage(to=(message_or_to,), subject=subject or "", text=body or "")
 
 
 class ConsoleMailer:
-    """Prints emails instead of sending. Keeps the last message for tests."""
+    """Print messages and retain the last one for development/tests."""
 
     def __init__(self) -> None:
-        self.last: Optional[dict] = None
+        self.last: Optional[dict[str, Any]] = None
 
-    def send(self, to: str, subject: str, body: str) -> None:
-        self.last = {"to": to, "subject": subject, "body": body}
-        print(f"\n--- maglink email ---\nTo: {to}\nSubject: {subject}\n\n{body}\n---------------------\n")
+    def send(
+        self,
+        message: Union[MailMessage, str],
+        subject: Optional[str] = None,
+        body: Optional[str] = None,
+    ) -> MailReceipt:
+        msg = _coerce_message(message, subject, body)
+        # Keep legacy keys so existing callers/tests continue to work.
+        self.last = {
+            "to": msg.to[0] if len(msg.to) == 1 else list(msg.to),
+            "subject": msg.subject,
+            "body": msg.text or "",
+            "message": msg,
+        }
+        print(
+            "\n--- maglink email ---\n"
+            f"To: {', '.join(msg.to)}\nSubject: {msg.subject}\n"
+            f"Priority: {msg.priority}\nPurpose: {msg.purpose}\n\n"
+            f"{msg.text or msg.html or ''}\n---------------------\n"
+        )
+        return MailReceipt(accepted=True, status="printed")
 
 
 class SmtpMailer:
+    """Synchronous direct SMTP transport.
+
+    Production services normally inject a durable queue mailer instead. This
+    implementation is useful for small standalone applications and propagates
+    failures so a login request is never reported as accepted when SMTP failed.
+    """
+
     def __init__(
         self,
         host: str,
@@ -41,46 +114,130 @@ class SmtpMailer:
         password: str = "",
         sender: str = "",
         use_ssl: Optional[bool] = None,
-        starttls: bool = False,
+        starttls: Optional[bool] = None,
         timeout: float = 15.0,
+        allow_plain: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.username = username
         self.password = password
         self.sender = sender or username
-        # Default to implicit SSL on the conventional SSL port unless told otherwise.
         self.use_ssl = (port == 465) if use_ssl is None else use_ssl
-        self.starttls = starttls
+        self.starttls = (port == 587) if starttls is None else starttls
         self.timeout = timeout
+        self.allow_plain = allow_plain
+        if not self.use_ssl and not self.starttls and not self.allow_plain:
+            raise ValueError("Plain SMTP is disabled; enable SSL/STARTTLS or set allow_plain=True")
 
-    def send(self, to: str, subject: str, body: str) -> None:
-        # Fire-and-forget: failures are logged, not surfaced to the user, so the
-        # response (and the rate-limit-uniform behaviour) is independent of SMTP.
-        t = threading.Thread(target=self._send_blocking, args=(to, subject, body), daemon=True)
-        t.start()
+    def send(
+        self,
+        message: Union[MailMessage, str],
+        subject: Optional[str] = None,
+        body: Optional[str] = None,
+    ) -> MailReceipt:
+        msg = _coerce_message(message, subject, body)
+        email = EmailMessage()
+        email["From"] = self.sender
+        email["To"] = ", ".join(msg.to)
+        email["Subject"] = msg.subject
+        if msg.reply_to:
+            email["Reply-To"] = msg.reply_to
+        if msg.text is not None:
+            email.set_content(msg.text)
+        else:
+            email.set_content("This message requires an HTML-capable email client.")
+        if msg.html is not None:
+            email.add_alternative(msg.html, subtype="html")
 
-    def _send_blocking(self, to: str, subject: str, body: str) -> None:
         try:
-            msg = EmailMessage()
-            msg["From"] = self.sender
-            msg["To"] = to
-            msg["Subject"] = subject
-            msg.set_content(body)
-
             if self.use_ssl:
-                ctx = ssl.create_default_context()
-                with smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout, context=ctx) as s:
+                with smtplib.SMTP_SSL(
+                    self.host,
+                    self.port,
+                    timeout=self.timeout,
+                    context=ssl.create_default_context(),
+                ) as smtp:
                     if self.username:
-                        s.login(self.username, self.password)
-                    s.send_message(msg)
+                        smtp.login(self.username, self.password)
+                    smtp.send_message(email)
             else:
-                with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as s:
+                with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as smtp:
+                    smtp.ehlo()
                     if self.starttls:
-                        s.starttls(context=ssl.create_default_context())
+                        smtp.starttls(context=ssl.create_default_context())
+                        smtp.ehlo()
                     if self.username:
-                        s.login(self.username, self.password)
-                    s.send_message(msg)
-            log.info("EMAIL_SENT to=%s", to)
-        except Exception as e:  # noqa: BLE001 - log and swallow; never crash the request thread
-            log.error("EMAIL_SEND_FAILED to=%s err=%s", to, e)
+                        smtp.login(self.username, self.password)
+                    smtp.send_message(email)
+        except Exception as exc:  # noqa: BLE001 - normalize transport failures
+            log.error("EMAIL_SEND_FAILED to=%s err=%s", ",".join(msg.to), exc)
+            raise MailDeliveryError(str(exc)) from exc
+
+        log.info("EMAIL_SENT to=%s", ",".join(msg.to))
+        return MailReceipt(accepted=True, status="sent")
+
+
+class HttpMailer:
+    """Submit mail to a generic JSON HTTP endpoint such as MailDispatch."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str,
+        *,
+        sender_id: Optional[str] = None,
+        timeout: float = 10.0,
+        extra_headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.sender_id = sender_id
+        self.timeout = timeout
+        self.extra_headers = dict(extra_headers or {})
+
+    def send(self, message: MailMessage) -> MailReceipt:
+        payload = {
+            "to": list(message.to),
+            "subject": message.subject,
+            "text": message.text,
+            "html": message.html,
+            "sender_id": message.sender_id or self.sender_id,
+            "reply_to": message.reply_to,
+            "priority": int(message.priority),
+            "purpose": message.purpose,
+            "metadata": message.metadata,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **self.extra_headers,
+        }
+        if message.idempotency_key:
+            headers["Idempotency-Key"] = message.idempotency_key
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8")
+                data = json.loads(raw) if raw else {}
+                if response.status < 200 or response.status >= 300:
+                    raise MailDeliveryError(f"mail endpoint returned HTTP {response.status}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise MailDeliveryError(f"mail endpoint returned HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise MailDeliveryError(f"mail endpoint failed: {exc}") from exc
+
+        if data.get("ok") is False:
+            raise MailDeliveryError(data.get("error") or "mail endpoint rejected message")
+        return MailReceipt(
+            accepted=True,
+            message_id=data.get("message_id") or data.get("id"),
+            status=data.get("status", "queued"),
+        )

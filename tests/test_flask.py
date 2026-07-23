@@ -53,12 +53,17 @@ def test_full_flask_flow(app_and_mailer):
     # confirm page (GET) is side-effect-free
     page = inbox.get(f"/api/auth/verify?token={token}")
     assert page.status_code == 200
-    assert user_code in page.get_data(as_text=True)
+    assert user_code not in page.get_data(as_text=True)
     # still pending
     assert device.get("/api/auth/status").get_json()["status"] == "pending"
 
-    # deliberate confirm (POST) from the inbox client
-    c = inbox.post(f"/api/auth/verify/confirm?token={token}")
+    # token alone cannot approve; deliberate confirm requires the device code.
+    c = inbox.post("/api/auth/verify/confirm", json={"token": token})
+    assert c.status_code == 400
+    assert device.get("/api/auth/status").get_json()["status"] == "pending"
+
+    # deliberate confirm (POST) from the inbox client with the waiting-device code
+    c = inbox.post("/api/auth/verify/confirm", json={"token": token, "user_code": user_code})
     assert c.get_json()["ok"]
 
     # device poll now approved -> session established
@@ -79,12 +84,53 @@ def test_confirm_from_wrong_session_does_not_log_in_attacker(app_and_mailer):
     device = app.test_client()
     attacker = app.test_client()
 
-    device.post("/api/auth/request", json={"email": "alice@example.test"})
+    r = device.post("/api/auth/request", json={"email": "alice@example.test"})
+    user_code = r.get_json()["user_code"]
     token = _token(mailer)
-    # attacker confirms the link, but they never had the request_id in session
-    attacker.post(f"/api/auth/verify/confirm?token={token}")
+    # attacker confirms the link with the code, but they never had the request_id in session
+    attacker.post("/api/auth/verify/confirm", json={"token": token, "user_code": user_code})
     # attacker's own status has no pending request -> not logged in
     assert attacker.get("/api/auth/status").get_json()["status"] == "expired"
     assert attacker.get("/protected").status_code == 401
     # the legitimate device, which holds the request_id, completes the login
     assert device.get("/api/auth/status").get_json()["status"] == "approved"
+
+
+def test_disallowed_email_status_is_uniform(app_and_mailer):
+    app, mailer = app_and_mailer
+    device = app.test_client()
+
+    r = device.post("/api/auth/request", json={"email": "mallory@example.test"})
+    assert r.status_code == 200 and r.get_json()["ok"]
+    assert mailer.last is None
+    assert device.get("/api/auth/status").get_json()["status"] == "pending"
+
+
+def test_x_forwarded_for_is_not_trusted_by_default():
+    mailer = ConsoleMailer()
+    core = AuthCore(
+        store=MemoryStore(),
+        mailer=mailer,
+        verify_url_base="http://localhost/api/auth/verify",
+        allowed_emails=["alice@example.test", "bob@example.test"],
+        rate_max=1,
+    )
+    auth = EmailAuth(core, require_captcha=False)
+    app = Flask(__name__)
+    app.secret_key = "test-secret"
+    app.register_blueprint(auth.blueprint())
+    client = app.test_client()
+
+    first = client.post(
+        "/api/auth/request",
+        json={"email": "alice@example.test"},
+        headers={"X-Forwarded-For": "203.0.113.1"},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/auth/request",
+        json={"email": "bob@example.test"},
+        headers={"X-Forwarded-For": "203.0.113.2"},
+    )
+    assert second.status_code == 429
