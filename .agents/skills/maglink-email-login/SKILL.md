@@ -167,7 +167,7 @@ app.register_blueprint(verifier.blueprint(url_prefix="/api/register"))
 ```
 
 After `/api/register/status` returns `verified`, the host must consume the
-verified address once from the same waiting-browser session:
+verified address once from the same waiting-browser session, after successful persistence:
 
 ```python
 email = verifier.verified_email()
@@ -183,8 +183,8 @@ Use `verified_email()` for non-consuming validation and consume it only after
 successful user persistence, so correctable validation errors do not force a
 new verification email. `email_allowed` is re-evaluated before maglink returns
 `verified`, but the host must also re-check eligibility at the final
-registration mutation because
-policy can change after polling. Email verification must not establish a login
+registration mutation because policy can change after polling. Email
+verification must not establish a login
 session. The application's identity provider should allow login only after both
 email verification and administrator approval are true.
 
