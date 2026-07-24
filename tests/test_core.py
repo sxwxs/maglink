@@ -2,7 +2,15 @@ import time
 
 import pytest
 
-from maglink import AuthCore, MemoryStore, SqliteStore, ConsoleMailer, AuthError, RateLimited
+from maglink import (
+    AuthCore,
+    MemoryStore,
+    SqliteStore,
+    ConsoleMailer,
+    AuthError,
+    MailDeliveryError,
+    RateLimited,
+)
 
 
 def make_core(store=None, **kw):
@@ -117,6 +125,36 @@ def test_rate_limit():
         core.start_login("alice@example.test", require_captcha=False, client_ip="1.2.3.4")
     with pytest.raises(RateLimited):
         core.start_login("alice@example.test", require_captcha=False, client_ip="1.2.3.4")
+
+
+def test_confirmation_attempts_are_rate_limited():
+    core, mailer = make_core(confirm_max_attempts=2)
+    lr = core.start_login("alice@example.test", require_captcha=False)
+    token = _token_from_email(mailer)
+    for _ in range(2):
+        with pytest.raises(AuthError):
+            core.confirm(token, "WRONG")
+    with pytest.raises(RateLimited):
+        core.confirm(token, lr.user_code)
+    assert core.poll_status(lr.request_id)["status"] == "pending"
+
+
+def test_mail_rejection_deletes_pending_request():
+    store = MemoryStore()
+
+    class RejectingMailer:
+        def send(self, message):
+            raise MailDeliveryError("rejected")
+
+    core = AuthCore(
+        store=store,
+        mailer=RejectingMailer(),
+        verify_url_base="https://example.test/api/auth/verify",
+        allowed_emails=["alice@example.test"],
+    )
+    with pytest.raises(AuthError, match="Could not queue"):
+        core.start_login("alice@example.test", require_captcha=False)
+    assert store._by_id == {}
 
 
 def test_sqlite_store_roundtrip_and_rate_cleanup(tmp_path):

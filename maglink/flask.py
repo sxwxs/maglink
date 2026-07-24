@@ -21,11 +21,14 @@ from flask import (
     session,
 )
 
-from .core import AuthCore, AuthError, RateLimited
+from .core import AuthCore, AuthError, EmailVerificationCore, RateLimited
 
 _SESSION_USER = "_maglink_user"
 _SESSION_REQ = "_maglink_request_id"
 _SESSION_CAPTCHA = "_maglink_captcha"
+_SESSION_VERIFY_REQ = "_maglink_verify_request_id"
+_SESSION_VERIFY_CAPTCHA = "_maglink_verify_captcha"
+_SESSION_VERIFIED_EMAIL = "_maglink_verified_email"
 
 
 class EmailAuth:
@@ -184,7 +187,111 @@ class EmailAuth:
         return request.remote_addr or ""
 
 
-def _confirm_html(token: str, ctx: dict) -> str:
+class EmailVerifier:
+    """Flask adapter for email ownership verification without authentication.
+
+    A successfully verified address is kept in the waiting browser's signed
+    session until the host application consumes it exactly once.
+    """
+
+    def __init__(
+        self,
+        core: EmailVerificationCore,
+        *,
+        require_captcha: bool = True,
+        trust_proxy_headers: bool = False,
+    ) -> None:
+        self.core = core
+        self.require_captcha = require_captcha
+        self.trust_proxy_headers = trust_proxy_headers
+
+    def verified_email(self) -> Optional[str]:
+        """Return the waiting session's verified email without consuming it."""
+        email = session.get(_SESSION_VERIFIED_EMAIL)
+        return str(email) if email else None
+
+    def consume_verified_email(self) -> Optional[str]:
+        """Consume and return the waiting session's verified email exactly once."""
+        email = session.pop(_SESSION_VERIFIED_EMAIL, None)
+        return str(email) if email else None
+
+    def blueprint(
+        self,
+        name: str = "maglink_verify",
+        url_prefix: str = "/api/email-verification",
+    ) -> Blueprint:
+        bp = Blueprint(name, __name__, url_prefix=url_prefix)
+
+        @bp.get("/captcha")
+        def captcha():
+            code, svg = self.core.new_captcha()
+            session[_SESSION_VERIFY_CAPTCHA] = code
+            return jsonify({"ok": True, "image": svg})
+
+        @bp.post("/request")
+        def request_verification():
+            data = request.get_json(silent=True) or request.form
+            email = (data.get("email") or "").strip()
+            captcha_given = data.get("captcha") or ""
+            captcha_expected = session.pop(_SESSION_VERIFY_CAPTCHA, "")
+            session.pop(_SESSION_VERIFIED_EMAIL, None)
+            try:
+                result = self.core.start_login(
+                    email,
+                    captcha_given=captcha_given,
+                    captcha_expected=captcha_expected,
+                    client_ip=self._client_ip(),
+                    require_captcha=self.require_captcha,
+                )
+            except RateLimited as exc:
+                return jsonify({"ok": False, "error": "rate_limited", "message": str(exc)}), 429
+            except AuthError as exc:
+                return jsonify({"ok": False, "error": "invalid", "message": str(exc)}), 400
+            session[_SESSION_VERIFY_REQ] = result.request_id
+            return jsonify({"ok": True, "user_code": result.user_code})
+
+        @bp.get("/verify")
+        def verify_page():
+            token = request.args.get("token", "")
+            ctx = self.core.confirm_context(token)
+            return _confirm_html(token, ctx, action="verify your email"), 200, {
+                "Content-Type": "text/html; charset=utf-8"
+            }
+
+        @bp.post("/verify/confirm")
+        def verify_confirm():
+            data = request.get_json(silent=True) or request.form
+            token = data.get("token") or request.args.get("token", "")
+            user_code = data.get("user_code") or data.get("code") or ""
+            try:
+                result = self.core.confirm(token, user_code)
+            except RateLimited as exc:
+                return jsonify({"ok": False, "error": "rate_limited", "message": str(exc)}), 429
+            except AuthError as exc:
+                return jsonify({"ok": False, "error": "invalid", "message": str(exc)}), 400
+            return jsonify({"ok": True, "email": result["email"]})
+
+        @bp.get("/status")
+        def status():
+            request_id = session.get(_SESSION_VERIFY_REQ, "")
+            result = self.core.poll_status(request_id)
+            if result["status"] == "verified":
+                session[_SESSION_VERIFIED_EMAIL] = result["email"]
+                session.pop(_SESSION_VERIFY_REQ, None)
+                return jsonify({"ok": True, "status": "verified", "email": result["email"]})
+            return jsonify({"ok": True, "status": result["status"]})
+
+        return bp
+
+    def _client_ip(self) -> str:
+        if self.trust_proxy_headers:
+            forwarded = request.headers.get("X-Forwarded-For", "")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        return request.remote_addr or ""
+
+
+def _confirm_html(token: str, ctx: dict, action: str = "sign in") -> str:
     if not ctx.get("valid"):
         return (
             "<!doctype html><meta charset=utf-8><title>Sign-in</title>"
@@ -201,11 +308,12 @@ def _confirm_html(token: str, ctx: dict) -> str:
         else ""
     )
     # Confirm requires a deliberate POST. GET (prefetch) never authenticates.
-    return f"""<!doctype html><meta charset=utf-8><title>Confirm sign-in</title>
+    safe_action = html.escape(action)
+    return f"""<!doctype html><meta charset=utf-8><title>Confirm</title>
 <body style="font-family:system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem">
-<h1>Confirm sign-in</h1>
-<p>You're signing in as <b>{email}</b>.</p>
-<p>Enter the code shown on the device where you started signing in.</p>
+<h1>Confirm</h1>
+<p>Continue as <b>{email}</b> to {safe_action}.</p>
+<p>Enter the code shown on the device where you started.</p>
 {done}
 <form id="confirm-form">
   <input id="token" type="hidden" value="{safe_token}">

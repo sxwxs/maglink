@@ -61,7 +61,7 @@ Recommended development dependency declaration:
 ```toml
 [project]
 dependencies = [
-  "maglink[flask]>=0.2.0",
+  "maglink[flask]>=0.3.0",
 ]
 ```
 
@@ -145,6 +145,53 @@ def create_app() -> Flask:
 ```
 
 Adapt names to the host project instead of creating a second Flask app.
+
+## Verified registration before approval
+
+For public registration where mailbox ownership must be proven before a
+pending user is created, use `EmailVerificationCore` with `EmailVerifier`.
+Do not temporarily make pending users login-eligible.
+
+```python
+from maglink import EmailVerificationCore
+from maglink.flask import EmailVerifier
+
+verification_core = EmailVerificationCore(
+    store=store,
+    mailer=mailer,
+    verify_url_base=f"{PUBLIC_BASE_URL}/api/register/verify",
+    email_allowed=lambda email: public_registration_enabled or is_invited(email),
+)
+verifier = EmailVerifier(verification_core, require_captcha=True)
+app.register_blueprint(verifier.blueprint(url_prefix="/api/register"))
+```
+
+After `/api/register/status` returns `verified`, the host must consume the
+verified address once from the same waiting-browser session:
+
+```python
+email = verifier.verified_email()
+if email is None:
+    abort(403)
+if not public_registration_enabled and not is_invited(email):
+    abort(403)
+create_pending_user(email)
+verifier.consume_verified_email()  # only after successful persistence
+```
+
+Use `verified_email()` for non-consuming validation and consume it only after
+successful user persistence, so correctable validation errors do not force a
+new verification email. `email_allowed` is re-evaluated before maglink returns
+`verified`, but the host must also re-check eligibility at the final
+registration mutation because
+policy can change after polling. Email verification must not establish a login
+session. The application's identity provider should allow login only after both
+email verification and administrator approval are true.
+
+Login and email-verification cores can safely share one store: their default
+rate-limit namespaces are `login` and `verification`. Give additional flows an
+explicit unique `rate_namespace`; cores intentionally using the same namespace
+must use compatible rate-limit settings.
 
 ## Identity provider
 

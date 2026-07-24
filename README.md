@@ -143,6 +143,49 @@ inside the application's `IdentityProvider`.
 
 A complete integration is available in `examples/maildispatch_login.py`.
 
+## Verify an email before registration
+
+Use `EmailVerificationCore` and the Flask `EmailVerifier` when a host needs to
+prove mailbox ownership without creating a login session. This supports flows
+such as verified registration followed by administrator approval.
+
+```python
+from maglink import EmailVerificationCore, SqliteStore
+from maglink.flask import EmailVerifier
+
+verification_core = EmailVerificationCore(
+    store=SqliteStore("data/auth.db"),
+    mailer=mailer,
+    verify_url_base="https://app.example.com/api/register/verify",
+    # Optional: when omitted, every syntactically valid email is eligible.
+    email_allowed=lambda email: public_registration or is_invited(email),
+)
+verifier = EmailVerifier(verification_core, require_captcha=True)
+app.register_blueprint(verifier.blueprint(url_prefix="/api/register"))
+
+@app.post("/register/complete")
+def complete_registration():
+    email = verifier.verified_email()
+    if email is None:
+        return {"error": "email_verification_required"}, 403
+    if not public_registration and not is_invited(email):
+        return {"error": "registration_not_allowed"}, 403
+    create_pending_user(email)
+    verifier.consume_verified_email()  # only after successful persistence
+    return {"ok": True, "status": "pending"}, 201
+```
+
+The verified email is bound to the waiting browser's signed session.
+`verified_email()` reads it without consuming it, allowing correctable input
+errors to be retried without another email. Call `consume_verified_email()`
+only after successful persistence. `EmailVerifier` never creates an
+authenticated user session. `email_allowed` is checked both before mail
+delivery and again before
+`verified` is returned. Because policy can still change between status polling
+and the final database mutation, the application must re-check current
+registration eligibility immediately before creating the user. The application
+remains responsible for registration, approval, and roles.
+
 ## Dynamic identities
 
 Authentication proves control of an email address. Authorization should come
@@ -211,6 +254,7 @@ Important constructor options:
 | `rate_max` | Maximum requests per rate window |
 | `rate_window` | Login request rate window in seconds |
 | `confirm_max_attempts` | Maximum code attempts per email token |
+| `rate_namespace` | Prefix isolating counters for multiple flows sharing one store; login defaults to `login` and email verification to `verification` |
 | `login_sender_id` | Sender identifier passed to the mail service |
 | `login_mail_priority` | Priority passed to the mail service |
 
@@ -266,6 +310,12 @@ Blueprint endpoints:
 | `GET` | `/status` | Poll and establish the waiting-device session |
 | `GET`/`POST` | `/logout` | Clear authentication state |
 | `GET` | `/state` | Return login state for a frontend |
+
+The `EmailVerifier` blueprint exposes the same CAPTCHA/request/verify/confirm
+shape under its configured prefix. Its status endpoint returns `verified`.
+The host reads the result non-destructively with `verified_email()`, performs
+validation and persistence, then calls `consume_verified_email()` in the same
+waiting-browser session only after success.
 
 ## Mail delivery
 

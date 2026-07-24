@@ -25,7 +25,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from .captcha import Captcha
 from .identity import Identity, IdentityProvider, StaticIdentityProvider
@@ -78,9 +78,9 @@ def _check_user_code(expected: str, given: str) -> bool:
     return secrets.compare_digest(normalized_expected, normalized_given)
 
 
-def _rate_key(kind: str, value: str) -> str:
+def _rate_key(namespace: str, kind: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return f"{kind}:{digest}"
+    return f"{namespace}:{kind}:{digest}"
 
 
 class AuthCore:
@@ -102,6 +102,7 @@ class AuthCore:
         login_sender_id: Optional[str] = None,
         login_mail_priority: int = int(MailPriority.AUTHENTICATION),
         confirm_max_attempts: int = 8,
+        rate_namespace: str = "login",
     ) -> None:
         self.store = store
         self.mailer = mailer
@@ -119,6 +120,10 @@ class AuthCore:
         self.login_sender_id = login_sender_id
         self.login_mail_priority = int(login_mail_priority)
         self.confirm_max_attempts = confirm_max_attempts
+        rate_namespace = (rate_namespace or "").strip()
+        if not rate_namespace or len(rate_namespace) > 64 or not re.fullmatch(r"[A-Za-z0-9_.-]+", rate_namespace):
+            raise ValueError("rate_namespace must contain only letters, digits, '_', '-', or '.'")
+        self.rate_namespace = rate_namespace
 
     # ---- helpers ---------------------------------------------------------
 
@@ -151,10 +156,10 @@ class AuthCore:
         now = _now()
         self.store.purge_expired(now)
 
-        self._check_rate(_rate_key("ip", client_ip), now)
+        self._check_rate(_rate_key(self.rate_namespace, "ip", client_ip), now)
         if len(email) > 320 or not _EMAIL_RE.match(email):
             raise AuthError("Invalid email address.")
-        self._check_rate(_rate_key("email", email), now)
+        self._check_rate(_rate_key(self.rate_namespace, "email", email), now)
         if require_captcha and not Captcha.check(captcha_expected, captcha_given):
             raise AuthError("Incorrect captcha.")
 
@@ -177,24 +182,7 @@ class AuthCore:
         # disallowed addresses so status polling cannot enumerate the allowlist.
         if self.is_email_allowed(email):
             link = f"{self.verify_url_base}?token={verify_token}"
-            body = (
-                f"Someone requested a sign-in for this email.\n\n"
-                f"Open this link to continue:\n{link}\n\n"
-                f"The device where you started signing in shows a short code. "
-                f"Enter that code on the confirmation page to approve the sign-in.\n\n"
-                f"If you didn't request this, ignore this email.\n"
-                f"This link expires in {int(self.code_ttl // 60)} minutes."
-            )
-            message = MailMessage(
-                to=(email,),
-                subject=self.email_subject,
-                text=body,
-                sender_id=self.login_sender_id,
-                priority=self.login_mail_priority,
-                purpose="authentication",
-                idempotency_key=f"maglink:{request_id}",
-                metadata={"request_id": request_id},
-            )
+            message = self._mail_message(email, link, request_id)
             try:
                 self.mailer.send(message)
             except MailDeliveryError as exc:
@@ -214,6 +202,26 @@ class AuthCore:
         # request_id + user_code returned regardless; for a disallowed email the
         # request stays pending until expiry but no email token is delivered.
         return LoginRequest(request_id=request_id, user_code=user_code)
+
+    def _mail_message(self, email: str, link: str, request_id: str) -> MailMessage:
+        body = (
+            f"Someone requested a sign-in for this email.\n\n"
+            f"Open this link to continue:\n{link}\n\n"
+            f"The device where you started signing in shows a short code. "
+            f"Enter that code on the confirmation page to approve the sign-in.\n\n"
+            f"If you didn't request this, ignore this email.\n"
+            f"This link expires in {int(self.code_ttl // 60)} minutes."
+        )
+        return MailMessage(
+            to=(email,),
+            subject=self.email_subject,
+            text=body,
+            sender_id=self.login_sender_id,
+            priority=self.login_mail_priority,
+            purpose="authentication",
+            idempotency_key=f"maglink:{request_id}",
+            metadata={"request_id": request_id},
+        )
 
     def _check_rate(self, key: str, now: float) -> None:
         count = self.store.incr_rate(key, now, self.rate_window)
@@ -244,7 +252,7 @@ class AuthCore:
             raise AuthError("This sign-in link is invalid or has expired.")
         if self.confirm_max_attempts > 0:
             count = self.store.incr_rate(
-                _rate_key("confirm", token), now, self.code_ttl
+                _rate_key(self.rate_namespace, "confirm", token), now, self.code_ttl
             )
             if count > self.confirm_max_attempts:
                 raise RateLimited("Too many confirmation attempts. Start again.")
@@ -264,9 +272,8 @@ class AuthCore:
 
     # ---- step 4: waiting device polls ------------------------------------
 
-    def poll_status(self, request_id: str) -> dict:
-        """Called by the waiting device. On 'approved', atomically completes and
-        returns the email so the adapter can establish the session."""
+    def _consume_approved(self, request_id: str) -> dict:
+        """Atomically consume an approved request for the waiting device."""
         now = _now()
         req = self.store.get(request_id or "")
         if req is None or req.expires_at < now:
@@ -274,21 +281,103 @@ class AuthCore:
         if req.status == "pending":
             return {"status": "pending"}
         if req.status == "approved":
-            # Consume single-use: approved -> consumed, atomically. Only the
-            # winner of the CAS gets to complete the login.
             if self.store.set_status(request_id, "approved", "consumed"):
                 self.store.delete(request_id)
-                log.info("LOGIN_SUCCESS email=%s request_id=%s", req.email, request_id)
-                identity = self.get_identity(req.email)
-                if identity is None or not identity.active:
-                    return {"status": "expired"}
-                return {
-                    "status": "approved",
-                    "email": req.email,
-                    "identity_id": identity.id,
-                    "roles": list(identity.roles),
-                    "claims": identity.claims,
-                    "is_admin": identity.is_admin,
-                }
+                return {"status": "approved", "email": req.email}
             return {"status": "pending"}
         return {"status": "expired"}
+
+    def poll_status(self, request_id: str) -> dict:
+        """Consume approval and resolve the current login identity."""
+        result = self._consume_approved(request_id)
+        if result["status"] != "approved":
+            return result
+        email = result["email"]
+        log.info("LOGIN_SUCCESS email=%s request_id=%s", email, request_id)
+        identity = self.get_identity(email)
+        if identity is None or not identity.active:
+            return {"status": "expired"}
+        return {
+            "status": "approved",
+            "email": email,
+            "identity_id": identity.id,
+            "roles": list(identity.roles),
+            "claims": identity.claims,
+            "is_admin": identity.is_admin,
+        }
+
+
+class EmailVerificationCore(AuthCore):
+    """Device-confirmed email ownership verification without login sessions.
+
+    Every syntactically valid address is eligible. Hosts consume the verified
+    email from the waiting browser and decide whether to register or update a
+    user. No application identity is created by this core.
+    """
+
+    def __init__(
+        self,
+        store: TokenStore,
+        mailer: Mailer,
+        *,
+        verify_url_base: str,
+        email_allowed: Optional[Callable[[str], bool]] = None,
+        **kwargs,
+    ) -> None:
+        if "identity_provider" in kwargs or "allowed_emails" in kwargs or "admin_emails" in kwargs:
+            raise TypeError("EmailVerificationCore does not accept login identity options")
+        kwargs.pop("allow_anyone", None)
+        kwargs.setdefault("email_subject", "Verify your email address")
+        kwargs.setdefault("rate_namespace", "verification")
+        self.email_allowed = email_allowed
+        super().__init__(
+            store=store,
+            mailer=mailer,
+            verify_url_base=verify_url_base,
+            allow_anyone=True,
+            **kwargs,
+        )
+
+    def is_email_allowed(self, email: str) -> bool:
+        if self.email_allowed is None:
+            return True
+        return bool(self.email_allowed(email.strip().lower()))
+
+    def _mail_message(self, email: str, link: str, request_id: str) -> MailMessage:
+        body = (
+            f"Someone requested verification of this email address.\n\n"
+            f"Open this link to continue:\n{link}\n\n"
+            f"The device where verification started shows a short code. "
+            f"Enter that code on the confirmation page to verify the address.\n\n"
+            f"If you didn't request this, ignore this email.\n"
+            f"This link expires in {int(self.code_ttl // 60)} minutes."
+        )
+        return MailMessage(
+            to=(email,),
+            subject=self.email_subject,
+            text=body,
+            sender_id=self.login_sender_id,
+            priority=self.login_mail_priority,
+            purpose="authentication",
+            idempotency_key=f"maglink:verify:{request_id}",
+            metadata={"request_id": request_id, "flow": "email_verification"},
+        )
+
+    def poll_status(self, request_id: str) -> dict:
+        result = self._consume_approved(request_id)
+        if result["status"] == "approved":
+            email = result["email"]
+            # Eligibility may change after the email was sent (for example an
+            # invitation can be revoked). Re-check before exposing a verified
+            # result to the waiting browser. Hosts must still re-check policy
+            # when performing the final registration mutation.
+            if not self.is_email_allowed(email):
+                log.info(
+                    "EMAIL_VERIFICATION_INELIGIBLE email=%s request_id=%s",
+                    email,
+                    request_id,
+                )
+                return {"status": "expired"}
+            log.info("EMAIL_VERIFIED email=%s request_id=%s", email, request_id)
+            return {"status": "verified", "email": email}
+        return result
